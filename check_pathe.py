@@ -78,85 +78,107 @@ def accept_cookies(page) -> None:
 
 def check_availability() -> tuple[bool, dict]:
     """
-    Détection fiable :
-    - ouvre la page du cinéma Pathé Brumath
-    - repère le bloc du film via le DOM (h3 > span)
-    - compte les horaires HH:MM dans ce bloc
+    Méthode fiable: on ouvre la page et on capte les réponses JSON (API)
+    qui contiennent les séances. Ensuite on cherche des horaires HH:MM.
     """
     debug_info = {
-        "brumath_present": True,
+        "available": False,
         "film_found": False,
         "nb_horaires": 0,
         "error": None,
+        "matched_json_urls": [],
     }
 
-    def accept_cookies(page):
+    def accept_cookies(page) -> None:
         for _ in range(3):
-            for txt in ["Tout accepter", "Accepter", "J'accepte", "OK"]:
+            for txt in ["Tout accepter", "Accepter", "J'accepte", "OK", "Continuer"]:
                 try:
                     page.get_by_role("button", name=re.compile(txt, re.I)).click(timeout=1500)
-                    log("🍪 Cookies acceptés")
+                    log("🍪 Cookies acceptés/fermés")
                     page.wait_for_timeout(400)
                     return
                 except Exception:
                     pass
-            page.wait_for_timeout(600)
+            page.wait_for_timeout(700)
 
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            context = browser.new_context()
+            context = browser.new_context(locale="fr-FR")
             page = context.new_page()
-            page.set_default_timeout(45000)
+            page.set_default_timeout(60000)
 
-            # 1) Ouvrir la page cinéma Brumath
+            collected = []  # liste de tuples (url, text)
+
+            def on_response(resp):
+                try:
+                    ct = resp.headers.get("content-type", "")
+                    if "application/json" not in ct:
+                        return
+                    url = resp.url
+                    # On filtre un peu pour éviter trop de bruit
+                    if "pathe.fr" not in url:
+                        return
+                    txt = resp.text()
+                    # On garde seulement les JSON qui contiennent au moins un horaire
+                    if re.search(r"\b(?:[01]\d|2[0-3]):[0-5]\d\b", txt):
+                        collected.append((url, txt))
+                except Exception:
+                    pass
+
+            page.on("response", on_response)
+
             log(f"🏢 Ouverture cinéma: {CINEMA_URL}")
             page.goto(CINEMA_URL, wait_until="networkidle")
             page.wait_for_timeout(2500)
             accept_cookies(page)
-            page.wait_for_timeout(1500)
 
-            # 2) Trouver le titre du film (DOM réel)
-            film_title = page.locator(
-                "h3 span",
-                has_text=re.compile("avatar", re.I)
-            ).first
+            # Laisser du temps au JS pour charger les séances + API
+            page.wait_for_timeout(7000)
 
-            if not film_title.count():
-                log("ℹ️ Film non trouvé dans le DOM")
-                browser.close()
-                return False, debug_info
-
-            debug_info["film_found"] = True
-            log("✅ Film détecté dans le DOM")
-
-            # 3) Remonter au bloc parent du film
-            film_block = film_title.locator("xpath=ancestor::div[contains(@class,'tw:flex')]").first
-
-            # 4) Chercher les horaires dans ce bloc
-            horaires = film_block.locator(
-                "text=/\\b([01]\\d|2[0-3]):[0-5]\\d\\b/"
-            )
-
-            nb_horaires = horaires.count()
-            debug_info["nb_horaires"] = nb_horaires
-
-            available = nb_horaires > 0
-
-            log(
-                f"🔎 film_found={debug_info['film_found']} | "
-                f"nb_horaires={nb_horaires} | available={available}"
-            )
+            # Si rien capté, on force un scroll (souvent déclenche un fetch)
+            if not collected:
+                try:
+                    page.mouse.wheel(0, 2000)
+                    page.wait_for_timeout(4000)
+                except Exception:
+                    pass
 
             browser.close()
-            return available, debug_info
+
+        # Analyse des JSON captés
+        film_low = FILM_NAME.lower()
+        total_times = 0
+
+        for url, txt in collected:
+            low = txt.lower()
+            # Le film peut apparaître soit par titre, soit par l'ID du film dans l'URL (11387)
+            film_match = (film_low in low) or ("11387" in low)  # pour Avatar test
+            if film_match:
+                times = re.findall(r"\b(?:[01]\d|2[0-3]):[0-5]\d\b", txt)
+                if times:
+                    debug_info["film_found"] = True
+                    total_times += len(times)
+                    debug_info["matched_json_urls"].append(url)
+
+        debug_info["nb_horaires"] = total_times
+        debug_info["available"] = debug_info["film_found"] and total_times > 0
+
+        log(
+            f"🔎 film_found={debug_info['film_found']} | "
+            f"nb_horaires={debug_info['nb_horaires']} | "
+            f"json_hits={len(debug_info['matched_json_urls'])} | "
+            f"available={debug_info['available']}"
+        )
+
+        return debug_info["available"], debug_info
 
     except PlaywrightTimeoutError as e:
         debug_info["error"] = f"Timeout Playwright: {e}"
         log(f"❌ {debug_info['error']}")
         return False, debug_info
     except Exception as e:
-        debug_info["error"] = f"Erreur scraping: {e}"
+        debug_info["error"] = f"Erreur scraping/API: {e}"
         log(f"❌ {debug_info['error']}")
         return False, debug_info
 
