@@ -47,6 +47,66 @@ def write_state(state: dict) -> None:
         log(f"❌ Impossible d'écrire {STATE_FILE}: {e}")
 
 
+def accept_cookies(page) -> None:
+    """
+    Essaie de fermer/valider le bandeau cookies Pathé.
+    Ne plante jamais si absent.
+    """
+    candidates = [
+        ("button", r"Tout accepter"),
+        ("button", r"Accepter( et fermer)?"),
+        ("button", r"J'?accepte"),
+        ("button", r"Continuer"),
+        ("button", r"OK"),
+        ("button", r"Fermer"),
+        ("link", r"Tout accepter"),
+        ("link", r"Accepter"),
+    ]
+
+    # Le bandeau peut apparaître après le chargement => plusieurs tentatives
+    for _ in range(3):
+        for role, pattern in candidates:
+            try:
+                page.get_by_role(role, name=re.compile(pattern, re.I)).click(timeout=1500)
+                log("🍪 Cookies acceptés/fermés")
+                page.wait_for_timeout(500)
+                return
+            except Exception:
+                pass
+        page.wait_for_timeout(700)
+
+
+def select_cinema_brumath(page) -> None:
+    """
+    Sélectionne le cinéma Pathé Brumath via /cinemas (plus fiable que sur la page film).
+    """
+    try:
+        log("🏢 Ouverture page cinémas…")
+        page.goto("https://www.pathe.fr/cinemas", wait_until="networkidle")
+        page.wait_for_timeout(1500)
+        accept_cookies(page)
+
+        log("🔎 Recherche du cinéma Brumath…")
+
+        # Champ de recherche (priorité type=search, sinon placeholder "Recherch", sinon premier input)
+        search_input = page.locator("input[type='search'], input[placeholder*='Recherch' i], input").first
+        search_input.click(timeout=7000)
+        search_input.fill("Brumath")
+
+        page.wait_for_timeout(800)
+
+        # Cliquer sur “Pathé Brumath” si visible, sinon “Brumath”
+        try:
+            page.get_by_text(re.compile(r"Pathé\s+Brumath", re.I)).first.click(timeout=8000)
+        except Exception:
+            page.get_by_text(re.compile(r"Brumath", re.I)).first.click(timeout=8000)
+
+        page.wait_for_timeout(1500)
+        log("✅ Cinéma Pathé Brumath sélectionné")
+    except Exception as e:
+        log(f"⚠️ Impossible de sélectionner le cinéma via /cinemas : {e}")
+
+
 def check_availability() -> tuple[bool, dict]:
     """
     Retourne (available, debug_info).
@@ -66,54 +126,15 @@ def check_availability() -> tuple[bool, dict]:
             page = context.new_page()
             page.set_default_timeout(30000)
 
-            log(f"🌐 Ouverture: {FILM_URL}")
+            # 1) Sélectionner le cinéma (cookie/pref) via /cinemas
+            select_cinema_brumath(page)
+
+            # 2) Ouvrir la page du film après sélection du cinéma
+            log(f"🎬 Ouverture page film: {FILM_URL}")
             page.goto(FILM_URL, wait_until="networkidle")
-            page.wait_for_timeout(2000)
-
-            # ===== SÉLECTION AUTOMATIQUE DU CINÉMA PATHÉ BRUMATH =====
-            try:
-                log("🎯 Sélection du cinéma Pathé Brumath…")
-
-                # 1) Ouvrir le sélecteur cinéma (bouton ou lien)
-                selectors = [
-                    page.get_by_role("button", name=re.compile(r"choisir.*cin|cinéma|mon cinéma|sélectionner", re.I)),
-                    page.get_by_role("link", name=re.compile(r"choisir.*cin|cinéma|mon cinéma|sélectionner", re.I)),
-                ]
-
-                opened = False
-                for s in selectors:
-                    try:
-                        s.click(timeout=4000)
-                        opened = True
-                        break
-                    except Exception:
-                        pass
-
-                if not opened:
-                    log("⚠️ Sélecteur cinéma non trouvé")
-                else:
-                    # 2) Champ de recherche cinéma
-                    search_input = page.locator(
-                        "input[placeholder*='Recherch' i], input[type='search'], input"
-                    ).first
-                    search_input.fill("Brumath")
-
-                    page.wait_for_timeout(600)
-
-                    # 3) Cliquer sur “Pathé Brumath” (priorité)
-                    try:
-                        page.get_by_text(re.compile(r"Pathé\s+Brumath", re.I)).first.click(timeout=5000)
-                    except Exception:
-                        page.get_by_text(re.compile(r"Brumath", re.I)).first.click(timeout=5000)
-
-                    # 4) Attente chargement séances
-                    page.wait_for_timeout(3500)
-                    log("✅ Cinéma Pathé Brumath sélectionné")
-
-            except Exception as e:
-                log(f"⚠️ Impossible de sélectionner le cinéma automatiquement : {e}")
-
-            # ===== FIN SÉLECTION CINÉMA =====
+            page.wait_for_timeout(1500)
+            accept_cookies(page)
+            page.wait_for_timeout(1000)
 
             body_text = page.inner_text("body")
             browser.close()
