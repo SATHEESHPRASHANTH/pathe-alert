@@ -78,50 +78,29 @@ def accept_cookies(page) -> None:
 
 def check_availability() -> tuple[bool, dict]:
     """
-    Vérifie la disponibilité sur la page du cinéma Pathé Brumath en détectant le film
-    même si le titre exact varie (accents/majuscules/ponctuation).
+    Détection fiable :
+    - ouvre la page du cinéma Pathé Brumath
+    - repère le bloc du film via le DOM (h3 > span)
+    - compte les horaires HH:MM dans ce bloc
     """
-    import unicodedata
-
     debug_info = {
         "brumath_present": True,
-        "reservation_signal": False,
+        "film_found": False,
         "nb_horaires": 0,
         "error": None,
-        "film_found_on_cinema_page": False,
-        "film_match_mode": None,   # "exact" | "keywords" | None
     }
 
-    def normalize(s: str) -> str:
-        s = s.replace("\u00a0", " ").lower()
-        s = "".join(
-            c for c in unicodedata.normalize("NFD", s)
-            if unicodedata.category(c) != "Mn"   # enlève accents
-        )
-        s = re.sub(r"\s+", " ", s).strip()
-        return s
-
-    def accept_cookies(page) -> None:
-        candidates = [
-            ("button", r"Tout accepter"),
-            ("button", r"Accepter( et fermer)?"),
-            ("button", r"J'?accepte"),
-            ("button", r"Continuer"),
-            ("button", r"OK"),
-            ("button", r"Fermer"),
-            ("link", r"Tout accepter"),
-            ("link", r"Accepter"),
-        ]
+    def accept_cookies(page):
         for _ in range(3):
-            for role, pattern in candidates:
+            for txt in ["Tout accepter", "Accepter", "J'accepte", "OK"]:
                 try:
-                    page.get_by_role(role, name=re.compile(pattern, re.I)).click(timeout=1500)
-                    log("🍪 Cookies acceptés/fermés")
+                    page.get_by_role("button", name=re.compile(txt, re.I)).click(timeout=1500)
+                    log("🍪 Cookies acceptés")
                     page.wait_for_timeout(400)
                     return
                 except Exception:
                     pass
-            page.wait_for_timeout(700)
+            page.wait_for_timeout(600)
 
     try:
         with sync_playwright() as p:
@@ -130,73 +109,47 @@ def check_availability() -> tuple[bool, dict]:
             page = context.new_page()
             page.set_default_timeout(45000)
 
+            # 1) Ouvrir la page cinéma Brumath
             log(f"🏢 Ouverture cinéma: {CINEMA_URL}")
             page.goto(CINEMA_URL, wait_until="networkidle")
             page.wait_for_timeout(2500)
             accept_cookies(page)
-            page.wait_for_timeout(1200)
+            page.wait_for_timeout(1500)
 
-            body_text = page.inner_text("body")
-            browser.close()
+            # 2) Trouver le titre du film (DOM réel)
+            film_title = page.locator(
+                "h3 span",
+                has_text=re.compile("avatar", re.I)
+            ).first
 
-        text_n = normalize(body_text)
-        film_n = normalize(FILM_NAME)
-
-        # 1) Match exact (normalisé)
-        idx = text_n.find(film_n)
-        if idx != -1:
-            debug_info["film_found_on_cinema_page"] = True
-            debug_info["film_match_mode"] = "exact"
-            log("✅ Film détecté (match exact normalisé)")
-            window = text_n[idx : idx + 7000]
-        else:
-            # 2) Match par mots-clés (plus robuste)
-            # On extrait des mots utiles et on teste leur présence
-            keywords = [w for w in re.findall(r"[a-z0-9]+", film_n) if len(w) >= 4]
-
-            # Pour éviter trop de mots inutiles, on garde seulement les plus importants si besoin
-            # (ex: avatar, feu, cendres)
-            # Si FILM_NAME est long, on garde les 6 premiers mots significatifs
-            keywords = keywords[:6]
-
-            # Si on n'a pas assez de mots, on force au moins "avatar"
-            if not keywords and "avatar" in text_n:
-                keywords = ["avatar"]
-
-            # Vérifie présence de la majorité des mots
-            hits = [k for k in keywords if k in text_n]
-            if keywords and len(hits) >= max(2, len(keywords) // 2):
-                debug_info["film_found_on_cinema_page"] = True
-                debug_info["film_match_mode"] = "keywords"
-                log(f"✅ Film détecté (mots-clés): {hits}")
-
-                # point de départ = premier mot clé trouvé
-                first_key = hits[0]
-                idx2 = text_n.find(first_key)
-                window = text_n[idx2 : idx2 + 7000]
-            else:
-                debug_info["film_found_on_cinema_page"] = False
-                log(f"ℹ️ Film non détecté. Mots-clés testés={keywords}, trouvés={hits}")
+            if not film_title.count():
+                log("ℹ️ Film non trouvé dans le DOM")
+                browser.close()
                 return False, debug_info
 
-        # Signaux réservation
-        reservation_keywords = ["reserver", "réserver", "e-billet", "billetterie"]
-        debug_info["reservation_signal"] = any(normalize(k) in window for k in reservation_keywords)
+            debug_info["film_found"] = True
+            log("✅ Film détecté dans le DOM")
 
-        # Horaires HH:MM
-        horaire_pattern = r"\b(?:[01]\d|2[0-3]):[0-5]\d\b"
-        horaires = re.findall(horaire_pattern, window)
-        debug_info["nb_horaires"] = len(horaires)
+            # 3) Remonter au bloc parent du film
+            film_block = film_title.locator("xpath=ancestor::div[contains(@class,'tw:flex')]").first
 
-        available = debug_info["reservation_signal"] or debug_info["nb_horaires"] > 0
+            # 4) Chercher les horaires dans ce bloc
+            horaires = film_block.locator(
+                "text=/\\b([01]\\d|2[0-3]):[0-5]\\d\\b/"
+            )
 
-        log(
-            f"🔎 film_found={debug_info['film_found_on_cinema_page']} | "
-            f"mode={debug_info['film_match_mode']} | "
-            f"reservation_signal={debug_info['reservation_signal']} | "
-            f"nb_horaires={debug_info['nb_horaires']} | available={available}"
-        )
-        return available, debug_info
+            nb_horaires = horaires.count()
+            debug_info["nb_horaires"] = nb_horaires
+
+            available = nb_horaires > 0
+
+            log(
+                f"🔎 film_found={debug_info['film_found']} | "
+                f"nb_horaires={nb_horaires} | available={available}"
+            )
+
+            browser.close()
+            return available, debug_info
 
     except PlaywrightTimeoutError as e:
         debug_info["error"] = f"Timeout Playwright: {e}"
