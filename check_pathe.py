@@ -17,6 +17,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 FILM_NAME = "Avatar : De feu et de cendres"
 FILM_URL = "https://www.pathe.fr/films/avatar-de-feu-et-de-cendres-11387"
 CINEMA_KEYWORD = "Brumath"
+CINEMA_URL = "https://www.pathe.fr/cinemas/cinema-pathe-brumath"
 STATE_FILE = "state.json"
 
 # --- SMTP Brevo ---
@@ -69,54 +70,28 @@ def accept_cookies(page) -> None:
             try:
                 page.get_by_role(role, name=re.compile(pattern, re.I)).click(timeout=1500)
                 log("🍪 Cookies acceptés/fermés")
-                page.wait_for_timeout(500)
+                page.wait_for_timeout(400)
                 return
             except Exception:
                 pass
         page.wait_for_timeout(700)
 
 
-def select_cinema_brumath(page) -> None:
-    """
-    Sélectionne le cinéma Pathé Brumath via /cinemas (plus fiable que sur la page film).
-    """
-    try:
-        log("🏢 Ouverture page cinémas…")
-        page.goto("https://www.pathe.fr/cinemas", wait_until="networkidle")
-        page.wait_for_timeout(1500)
-        accept_cookies(page)
-
-        log("🔎 Recherche du cinéma Brumath…")
-
-        # Champ de recherche (priorité type=search, sinon placeholder "Recherch", sinon premier input)
-        search_input = page.locator("input[type='search'], input[placeholder*='Recherch' i], input").first
-        search_input.click(timeout=7000)
-        search_input.fill("Brumath")
-
-        page.wait_for_timeout(800)
-
-        # Cliquer sur “Pathé Brumath” si visible, sinon “Brumath”
-        try:
-            page.get_by_text(re.compile(r"Pathé\s+Brumath", re.I)).first.click(timeout=8000)
-        except Exception:
-            page.get_by_text(re.compile(r"Brumath", re.I)).first.click(timeout=8000)
-
-        page.wait_for_timeout(1500)
-        log("✅ Cinéma Pathé Brumath sélectionné")
-    except Exception as e:
-        log(f"⚠️ Impossible de sélectionner le cinéma via /cinemas : {e}")
-
-
 def check_availability() -> tuple[bool, dict]:
     """
+    Vérifie la disponibilité en passant par la page du cinéma Pathé Brumath
+    (pas besoin de sélectionner le cinéma).
+    Ensuite ouvre la page du film depuis la page cinéma, puis détecte horaires/réserver.
+
     Retourne (available, debug_info).
-    available = Brumath présent ET (signal réservation OU horaires HH:MM).
     """
     debug_info = {
-        "brumath_present": False,
+        "brumath_present": True,  # on est sur la page Brumath
         "reservation_signal": False,
         "nb_horaires": 0,
         "error": None,
+        "film_found_on_cinema_page": False,
+        "film_page_url": None,
     }
 
     try:
@@ -124,40 +99,50 @@ def check_availability() -> tuple[bool, dict]:
             browser = p.chromium.launch(headless=True)
             context = browser.new_context()
             page = context.new_page()
-            page.set_default_timeout(30000)
+            page.set_default_timeout(45000)
 
-            # 1) Sélectionner le cinéma (cookie/pref) via /cinemas
-            select_cinema_brumath(page)
-
-            # 2) Ouvrir la page du film après sélection du cinéma
-            log(f"🎬 Ouverture page film: {FILM_URL}")
-            page.goto(FILM_URL, wait_until="networkidle")
+            # 1) Ouvrir la page du CINÉMA Brumath
+            log(f"🏢 Ouverture cinéma: {CINEMA_URL}")
+            page.goto(CINEMA_URL, wait_until="networkidle")
             page.wait_for_timeout(1500)
             accept_cookies(page)
-            page.wait_for_timeout(1000)
 
+            # 2) Vérifier si le film est listé sur la page du cinéma
+            try:
+                page.get_by_role("link", name=re.compile(re.escape(FILM_NAME), re.I)).first.wait_for(timeout=8000)
+                debug_info["film_found_on_cinema_page"] = True
+                log("✅ Film trouvé sur la page cinéma")
+            except Exception:
+                log("ℹ️ Film non trouvé sur la page cinéma (pas encore programmé à Brumath)")
+                browser.close()
+                return False, debug_info
+
+            # 3) Cliquer sur le film depuis la page cinéma
+            page.get_by_role("link", name=re.compile(re.escape(FILM_NAME), re.I)).first.click(timeout=8000)
+            page.wait_for_load_state("networkidle")
+            page.wait_for_timeout(1500)
+
+            debug_info["film_page_url"] = page.url
+            log(f"🎬 Page film ouverte depuis cinéma: {page.url}")
+
+            accept_cookies(page)
+
+            # 4) Lire le texte et détecter réservation/horaires
             body_text = page.inner_text("body")
             browser.close()
 
-        # 1) Présence Brumath
-        brumath_present = CINEMA_KEYWORD.lower() in body_text.lower()
-        debug_info["brumath_present"] = brumath_present
-
-        # 2) Signaux réservation
         reservation_keywords = ["réserver", "reserver", "e-billet", "billetterie"]
         reservation_signal = any(k in body_text.lower() for k in reservation_keywords)
         debug_info["reservation_signal"] = reservation_signal
 
-        # 3) Horaires HH:MM
         horaire_pattern = r"\b(?:[01]\d|2[0-3]):[0-5]\d\b"
         horaires = re.findall(horaire_pattern, body_text)
         debug_info["nb_horaires"] = len(horaires)
 
-        available = brumath_present and (reservation_signal or debug_info["nb_horaires"] > 0)
+        available = reservation_signal or debug_info["nb_horaires"] > 0
 
         log(
-            f"🔎 brumath_present={debug_info['brumath_present']} | "
-            f"reservation_signal={debug_info['reservation_signal']} | "
+            f"🔎 reservation_signal={debug_info['reservation_signal']} | "
             f"nb_horaires={debug_info['nb_horaires']} | available={available}"
         )
         return available, debug_info
@@ -214,9 +199,11 @@ def main():
         body = (
             f"Film: {FILM_NAME}\n"
             f"Cinéma: Pathé {CINEMA_KEYWORD}\n"
-            f"URL: {FILM_URL}\n\n"
+            f"URL film: {FILM_URL}\n"
+            f"URL cinéma: {CINEMA_URL}\n\n"
             f"Détails:\n"
-            f"- brumath_present: {debug['brumath_present']}\n"
+            f"- film_found_on_cinema_page: {debug.get('film_found_on_cinema_page')}\n"
+            f"- film_page_url: {debug.get('film_page_url')}\n"
             f"- reservation_signal: {debug['reservation_signal']}\n"
             f"- nb_horaires: {debug['nb_horaires']}\n"
             f"- error: {debug.get('error')}\n\n"
