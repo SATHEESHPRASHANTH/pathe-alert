@@ -78,18 +78,50 @@ def accept_cookies(page) -> None:
 
 def check_availability() -> tuple[bool, dict]:
     """
-    Vérifie la disponibilité directement sur la page du cinéma Pathé Brumath :
-    - repère la section du film (par son titre)
-    - détecte des horaires HH:MM et/ou un signal de réservation dans cette section
+    Vérifie la disponibilité sur la page du cinéma Pathé Brumath en détectant le film
+    même si le titre exact varie (accents/majuscules/ponctuation).
     """
+    import unicodedata
+
     debug_info = {
         "brumath_present": True,
         "reservation_signal": False,
         "nb_horaires": 0,
         "error": None,
         "film_found_on_cinema_page": False,
-        "film_page_url": None,  # non utilisé dans cette approche
+        "film_match_mode": None,   # "exact" | "keywords" | None
     }
+
+    def normalize(s: str) -> str:
+        s = s.replace("\u00a0", " ").lower()
+        s = "".join(
+            c for c in unicodedata.normalize("NFD", s)
+            if unicodedata.category(c) != "Mn"   # enlève accents
+        )
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    def accept_cookies(page) -> None:
+        candidates = [
+            ("button", r"Tout accepter"),
+            ("button", r"Accepter( et fermer)?"),
+            ("button", r"J'?accepte"),
+            ("button", r"Continuer"),
+            ("button", r"OK"),
+            ("button", r"Fermer"),
+            ("link", r"Tout accepter"),
+            ("link", r"Accepter"),
+        ]
+        for _ in range(3):
+            for role, pattern in candidates:
+                try:
+                    page.get_by_role(role, name=re.compile(pattern, re.I)).click(timeout=1500)
+                    log("🍪 Cookies acceptés/fermés")
+                    page.wait_for_timeout(400)
+                    return
+                except Exception:
+                    pass
+            page.wait_for_timeout(700)
 
     try:
         with sync_playwright() as p:
@@ -98,37 +130,58 @@ def check_availability() -> tuple[bool, dict]:
             page = context.new_page()
             page.set_default_timeout(45000)
 
-            # 1) Ouvrir la page du cinéma Brumath
             log(f"🏢 Ouverture cinéma: {CINEMA_URL}")
             page.goto(CINEMA_URL, wait_until="networkidle")
-            page.wait_for_timeout(2000)
+            page.wait_for_timeout(2500)
             accept_cookies(page)
-            page.wait_for_timeout(1000)
+            page.wait_for_timeout(1200)
 
-            # 2) Lire texte complet
             body_text = page.inner_text("body")
             browser.close()
 
-        # Normalisation
-        text_low = body_text.lower().replace("\u00a0", " ")
-        film_low = FILM_NAME.lower().replace("\u00a0", " ")
+        text_n = normalize(body_text)
+        film_n = normalize(FILM_NAME)
 
-        # Repérer le film dans la page
-        idx = text_low.find(film_low)
-        if idx == -1:
-            debug_info["film_found_on_cinema_page"] = False
-            log("ℹ️ Film non trouvé sur la page cinéma (titre non détecté).")
-            return False, debug_info
+        # 1) Match exact (normalisé)
+        idx = text_n.find(film_n)
+        if idx != -1:
+            debug_info["film_found_on_cinema_page"] = True
+            debug_info["film_match_mode"] = "exact"
+            log("✅ Film détecté (match exact normalisé)")
+            window = text_n[idx : idx + 7000]
+        else:
+            # 2) Match par mots-clés (plus robuste)
+            # On extrait des mots utiles et on teste leur présence
+            keywords = [w for w in re.findall(r"[a-z0-9]+", film_n) if len(w) >= 4]
 
-        debug_info["film_found_on_cinema_page"] = True
-        log("✅ Film détecté sur la page cinéma")
+            # Pour éviter trop de mots inutiles, on garde seulement les plus importants si besoin
+            # (ex: avatar, feu, cendres)
+            # Si FILM_NAME est long, on garde les 6 premiers mots significatifs
+            keywords = keywords[:6]
 
-        # Prendre une fenêtre de texte après le titre pour capturer les horaires associés à ce film
-        window = text_low[idx : idx + 6000]
+            # Si on n'a pas assez de mots, on force au moins "avatar"
+            if not keywords and "avatar" in text_n:
+                keywords = ["avatar"]
 
-        # Signaux réservation (optionnel)
-        reservation_keywords = ["réserver", "reserver", "e-billet", "billetterie"]
-        debug_info["reservation_signal"] = any(k in window for k in reservation_keywords)
+            # Vérifie présence de la majorité des mots
+            hits = [k for k in keywords if k in text_n]
+            if keywords and len(hits) >= max(2, len(keywords) // 2):
+                debug_info["film_found_on_cinema_page"] = True
+                debug_info["film_match_mode"] = "keywords"
+                log(f"✅ Film détecté (mots-clés): {hits}")
+
+                # point de départ = premier mot clé trouvé
+                first_key = hits[0]
+                idx2 = text_n.find(first_key)
+                window = text_n[idx2 : idx2 + 7000]
+            else:
+                debug_info["film_found_on_cinema_page"] = False
+                log(f"ℹ️ Film non détecté. Mots-clés testés={keywords}, trouvés={hits}")
+                return False, debug_info
+
+        # Signaux réservation
+        reservation_keywords = ["reserver", "réserver", "e-billet", "billetterie"]
+        debug_info["reservation_signal"] = any(normalize(k) in window for k in reservation_keywords)
 
         # Horaires HH:MM
         horaire_pattern = r"\b(?:[01]\d|2[0-3]):[0-5]\d\b"
@@ -139,6 +192,7 @@ def check_availability() -> tuple[bool, dict]:
 
         log(
             f"🔎 film_found={debug_info['film_found_on_cinema_page']} | "
+            f"mode={debug_info['film_match_mode']} | "
             f"reservation_signal={debug_info['reservation_signal']} | "
             f"nb_horaires={debug_info['nb_horaires']} | available={available}"
         )
@@ -152,6 +206,7 @@ def check_availability() -> tuple[bool, dict]:
         debug_info["error"] = f"Erreur scraping: {e}"
         log(f"❌ {debug_info['error']}")
         return False, debug_info
+
 
 
 def send_email_brevo(subject: str, body: str) -> bool:
