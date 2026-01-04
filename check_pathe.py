@@ -35,7 +35,7 @@ def read_state() -> dict:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception as e:
-            log(f"⚠️  Impossible de lire {STATE_FILE} ({e}). État par défaut.")
+            log(f"⚠️ Impossible de lire {STATE_FILE} ({e}). État par défaut.")
     return {"last_status": "unavailable", "last_seen_at": None}
 
 
@@ -70,10 +70,55 @@ def check_availability() -> tuple[bool, dict]:
             page.goto(FILM_URL, wait_until="networkidle")
             page.wait_for_timeout(2000)
 
+            # ===== SÉLECTION AUTOMATIQUE DU CINÉMA PATHÉ BRUMATH =====
+            try:
+                log("🎯 Sélection du cinéma Pathé Brumath…")
+
+                # 1) Ouvrir le sélecteur cinéma (bouton ou lien)
+                selectors = [
+                    page.get_by_role("button", name=re.compile(r"choisir.*cin|cinéma|mon cinéma|sélectionner", re.I)),
+                    page.get_by_role("link", name=re.compile(r"choisir.*cin|cinéma|mon cinéma|sélectionner", re.I)),
+                ]
+
+                opened = False
+                for s in selectors:
+                    try:
+                        s.click(timeout=4000)
+                        opened = True
+                        break
+                    except Exception:
+                        pass
+
+                if not opened:
+                    log("⚠️ Sélecteur cinéma non trouvé")
+                else:
+                    # 2) Champ de recherche cinéma
+                    search_input = page.locator(
+                        "input[placeholder*='Recherch' i], input[type='search'], input"
+                    ).first
+                    search_input.fill("Brumath")
+
+                    page.wait_for_timeout(600)
+
+                    # 3) Cliquer sur “Pathé Brumath” (priorité)
+                    try:
+                        page.get_by_text(re.compile(r"Pathé\s+Brumath", re.I)).first.click(timeout=5000)
+                    except Exception:
+                        page.get_by_text(re.compile(r"Brumath", re.I)).first.click(timeout=5000)
+
+                    # 4) Attente chargement séances
+                    page.wait_for_timeout(3500)
+                    log("✅ Cinéma Pathé Brumath sélectionné")
+
+            except Exception as e:
+                log(f"⚠️ Impossible de sélectionner le cinéma automatiquement : {e}")
+
+            # ===== FIN SÉLECTION CINÉMA =====
+
             body_text = page.inner_text("body")
             browser.close()
 
-        # 1) Brumath
+        # 1) Présence Brumath
         brumath_present = CINEMA_KEYWORD.lower() in body_text.lower()
         debug_info["brumath_present"] = brumath_present
 
@@ -82,7 +127,7 @@ def check_availability() -> tuple[bool, dict]:
         reservation_signal = any(k in body_text.lower() for k in reservation_keywords)
         debug_info["reservation_signal"] = reservation_signal
 
-        # 3) Horaires HH:MM (capture le match complet)
+        # 3) Horaires HH:MM
         horaire_pattern = r"\b(?:[01]\d|2[0-3]):[0-5]\d\b"
         horaires = re.findall(horaire_pattern, body_text)
         debug_info["nb_horaires"] = len(horaires)
@@ -113,7 +158,7 @@ def send_email_brevo(subject: str, body: str) -> bool:
     to_email = os.environ.get("ALERT_TO_EMAIL", "satheeshprashanth2002@gmail.com")
 
     if not all([smtp_user, smtp_pass, from_email, to_email]):
-        log("❌ Variables SMTP manquantes : BREVO_SMTP_USER, BREVO_SMTP_KEY, BREVO_FROM_EMAIL, ALERT_TO_EMAIL")
+        log("❌ Variables SMTP manquantes")
         return False
 
     msg = MIMEMultipart()
@@ -123,7 +168,7 @@ def send_email_brevo(subject: str, body: str) -> bool:
     msg.attach(MIMEText(body, "plain", "utf-8"))
 
     try:
-        log("✉️  Connexion SMTP Brevo…")
+        log("✉️ Connexion SMTP Brevo…")
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
             server.starttls()
             server.login(smtp_user, smtp_pass)
@@ -139,16 +184,13 @@ def main():
     log("===== START =====")
     state = read_state()
     last_status = state.get("last_status", "unavailable")
-    log(f"📌 last_status={last_status}")
 
     available, debug = check_availability()
     new_status = "available" if available else "unavailable"
 
-    # Transition indispo -> dispo = envoi mail
     if new_status == "available" and last_status != "available":
         subject = f"🎬 Pathé Brumath: séances dispo - {FILM_NAME}"
         body = (
-            f"Des séances réservables semblent disponibles.\n\n"
             f"Film: {FILM_NAME}\n"
             f"Cinéma: Pathé {CINEMA_KEYWORD}\n"
             f"URL: {FILM_URL}\n\n"
@@ -157,16 +199,16 @@ def main():
             f"- reservation_signal: {debug['reservation_signal']}\n"
             f"- nb_horaires: {debug['nb_horaires']}\n"
             f"- error: {debug.get('error')}\n\n"
-            f"Date (UTC): {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
+            f"Date (UTC): {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
         )
         send_email_brevo(subject, body)
     else:
-        log("ℹ️  Pas de transition indispo->dispo, pas d'email.")
+        log("ℹ️ Pas de transition indispo->dispo")
 
     state["last_status"] = new_status
     state["last_seen_at"] = datetime.now(timezone.utc).isoformat()
     write_state(state)
-    log(f"💾 state.json mis à jour: {state}")
+
     log("===== END =====")
 
 
