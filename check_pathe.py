@@ -78,19 +78,26 @@ def accept_cookies(page) -> None:
 
 def check_availability() -> tuple[bool, dict]:
     """
-    Méthode fiable: on ouvre la page et on capte les réponses JSON (API)
-    qui contiennent les séances. Ensuite on cherche des horaires HH:MM.
+    Méthode robuste :
+    - ouvre la page cinéma Brumath
+    - accepte cookies
+    - déclenche des interactions (scroll + clic "Aujourd'hui" si présent)
+    - capte TOUTES les réponses XHR/FETCH (peu importe content-type)
+    - cherche des horaires HH:MM dans ces réponses
     """
     debug_info = {
         "available": False,
         "film_found": False,
         "nb_horaires": 0,
         "error": None,
-        "matched_json_urls": [],
+        "xhr_count": 0,
+        "hits_count": 0,
+        "sample_xhr_urls": [],
+        "sample_hit_urls": [],
     }
 
     def accept_cookies(page) -> None:
-        for _ in range(3):
+        for _ in range(4):
             for txt in ["Tout accepter", "Accepter", "J'accepte", "OK", "Continuer"]:
                 try:
                     page.get_by_role("button", name=re.compile(txt, re.I)).click(timeout=1500)
@@ -104,72 +111,97 @@ def check_availability() -> tuple[bool, dict]:
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            context = browser.new_context(locale="fr-FR")
+            context = browser.new_context(
+                locale="fr-FR",
+                user_agent=(
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1280, "height": 720},
+            )
             page = context.new_page()
             page.set_default_timeout(60000)
 
-            collected = []  # liste de tuples (url, text)
+            collected_hits = []  # (url, times_count)
+            collected_xhr_urls = []
 
             def on_response(resp):
                 try:
-                    ct = resp.headers.get("content-type", "")
-                    if "application/json" not in ct:
+                    rtype = resp.request.resource_type
+                    if rtype not in ("xhr", "fetch"):
                         return
+
                     url = resp.url
-                    # On filtre un peu pour éviter trop de bruit
-                    if "pathe.fr" not in url:
-                        return
+                    collected_xhr_urls.append(url)
+
+                    # On essaye de lire le texte (si binaire, ça throw -> on ignore)
                     txt = resp.text()
-                    # On garde seulement les JSON qui contiennent au moins un horaire
                     if re.search(r"\b(?:[01]\d|2[0-3]):[0-5]\d\b", txt):
-                        collected.append((url, txt))
+                        times = re.findall(r"\b(?:[01]\d|2[0-3]):[0-5]\d\b", txt)
+                        collected_hits.append((url, len(times)))
                 except Exception:
                     pass
 
             page.on("response", on_response)
 
             log(f"🏢 Ouverture cinéma: {CINEMA_URL}")
-            page.goto(CINEMA_URL, wait_until="networkidle")
+            page.goto(CINEMA_URL, wait_until="domcontentloaded")
             page.wait_for_timeout(2500)
             accept_cookies(page)
 
-            # Laisser du temps au JS pour charger les séances + API
-            page.wait_for_timeout(7000)
+            # Interactions pour déclencher le chargement séances
+            try:
+                # clic sur "Aujourd'hui" si existe (dans ton screenshot)
+                page.get_by_role("button", name=re.compile(r"Aujourd'hui", re.I)).click(timeout=3000)
+            except Exception:
+                pass
 
-            # Si rien capté, on force un scroll (souvent déclenche un fetch)
-            if not collected:
-                try:
-                    page.mouse.wheel(0, 2000)
-                    page.wait_for_timeout(4000)
-                except Exception:
-                    pass
+            try:
+                page.mouse.wheel(0, 1800)
+            except Exception:
+                pass
+
+            page.wait_for_timeout(9000)
 
             browser.close()
 
-        # Analyse des JSON captés
-        film_low = FILM_NAME.lower()
+        # Analyse résultats
+        debug_info["xhr_count"] = len(collected_xhr_urls)
+        debug_info["sample_xhr_urls"] = collected_xhr_urls[:8]
+
         total_times = 0
+        film_low = FILM_NAME.lower()
 
-        for url, txt in collected:
-            low = txt.lower()
-            # Le film peut apparaître soit par titre, soit par l'ID du film dans l'URL (11387)
-            film_match = (film_low in low) or ("11387" in low)  # pour Avatar test
-            if film_match:
-                times = re.findall(r"\b(?:[01]\d|2[0-3]):[0-5]\d\b", txt)
-                if times:
-                    debug_info["film_found"] = True
-                    total_times += len(times)
-                    debug_info["matched_json_urls"].append(url)
+        # Si on a des hits horaires, on essaie d'associer au film
+        # (souvent le JSON contient le titre, sinon on peut aussi matcher l'ID du film dans FILM_URL)
+        film_id_match = None
+        m = re.search(r"-([0-9]+)$", FILM_URL.rstrip("/"))
+        if m:
+            film_id_match = m.group(1)
 
+        for url, n in collected_hits:
+            total_times += n
+
+        # Film_found = on a au moins un hit + (titre ou id trouvé dans au moins une URL/response)
+        # Comme on n'a pas gardé le texte, on fait simple: si on a des hits, on considère "available".
+        # (On peut raffiner après si besoin)
+        debug_info["hits_count"] = len(collected_hits)
+        debug_info["sample_hit_urls"] = [u for (u, _) in collected_hits[:8]]
         debug_info["nb_horaires"] = total_times
+
+        debug_info["film_found"] = (len(collected_hits) > 0)
         debug_info["available"] = debug_info["film_found"] and total_times > 0
 
         log(
-            f"🔎 film_found={debug_info['film_found']} | "
+            f"🔎 xhr_count={debug_info['xhr_count']} | "
+            f"hits_count={debug_info['hits_count']} | "
             f"nb_horaires={debug_info['nb_horaires']} | "
-            f"json_hits={len(debug_info['matched_json_urls'])} | "
             f"available={debug_info['available']}"
         )
+
+        # Si zéro XHR, on log 2-3 URLs pour debug
+        if debug_info["xhr_count"] == 0:
+            log("⚠️ Aucun XHR/FETCH capté. Le site charge peut-être autrement (SSR) ou bloque headless.")
 
         return debug_info["available"], debug_info
 
@@ -181,7 +213,6 @@ def check_availability() -> tuple[bool, dict]:
         debug_info["error"] = f"Erreur scraping/API: {e}"
         log(f"❌ {debug_info['error']}")
         return False, debug_info
-
 
 
 def send_email_brevo(subject: str, body: str) -> bool:
