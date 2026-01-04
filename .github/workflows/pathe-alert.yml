@@ -1,0 +1,48 @@
+name: Surveillance Pathé Brumath
+
+on:
+  schedule:
+    # Exécution toutes les 5 minutes (cron en UTC)
+    - cron: '*/5 * * * *'
+  workflow_dispatch:  # Permet de lancer manuellement
+
+jobs:
+  check-pathe:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+      
+      - name: Install Playwright Chromium
+        run: |
+          python -m playwright install --with-deps chromium
+      
+      - name: Restore state.json cache
+        uses: actions/cache@v4
+        id: cache-state
+        with:
+          path: state.json
+          key: pathe-state-${{ github.run_id }}
+          restore-keys: |
+            pathe-state-
+          save-always: true
+      
+      - name: Run Pathé availability check
+        env:
+          BREVO_SMTP_USER: ${{ secrets.BREVO_SMTP_USER }}
+          BREVO_SMTP_KEY: ${{ secrets.BREVO_SMTP_KEY }}
+          BREVO_FROM_EMAIL: ${{ secrets.BREVO_FROM_EMAIL }}
+          ALERT_TO_EMAIL: ${{ secrets.ALERT_TO_EMAIL }}
+        run: |
+          python check_pathe.py
+
