@@ -14,7 +14,7 @@ from email.mime.multipart import MIMEMultipart
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError  # type: ignore
 
 # --- Constantes ---
-FILM_NAME = "Avatar : De feu et de cendres"
+FILM_NAME = "Avatar : de feu et de cendres"
 FILM_URL = "https://www.pathe.fr/films/avatar-de-feu-et-de-cendres-11387"
 CINEMA_KEYWORD = "Brumath"
 CINEMA_URL = "https://www.pathe.fr/cinemas/cinema-pathe-brumath"
@@ -64,7 +64,6 @@ def accept_cookies(page) -> None:
         ("link", r"Accepter"),
     ]
 
-    # Le bandeau peut apparaître après le chargement => plusieurs tentatives
     for _ in range(3):
         for role, pattern in candidates:
             try:
@@ -79,19 +78,17 @@ def accept_cookies(page) -> None:
 
 def check_availability() -> tuple[bool, dict]:
     """
-    Vérifie la disponibilité en passant par la page du cinéma Pathé Brumath
-    (pas besoin de sélectionner le cinéma).
-    Ensuite ouvre la page du film depuis la page cinéma, puis détecte horaires/réserver.
-
-    Retourne (available, debug_info).
+    Vérifie la disponibilité directement sur la page du cinéma Pathé Brumath :
+    - repère la section du film (par son titre)
+    - détecte des horaires HH:MM et/ou un signal de réservation dans cette section
     """
     debug_info = {
-        "brumath_present": True,  # on est sur la page Brumath
+        "brumath_present": True,
         "reservation_signal": False,
         "nb_horaires": 0,
         "error": None,
         "film_found_on_cinema_page": False,
-        "film_page_url": None,
+        "film_page_url": None,  # non utilisé dans cette approche
     }
 
     try:
@@ -101,48 +98,48 @@ def check_availability() -> tuple[bool, dict]:
             page = context.new_page()
             page.set_default_timeout(45000)
 
-            # 1) Ouvrir la page du CINÉMA Brumath
+            # 1) Ouvrir la page du cinéma Brumath
             log(f"🏢 Ouverture cinéma: {CINEMA_URL}")
             page.goto(CINEMA_URL, wait_until="networkidle")
-            page.wait_for_timeout(1500)
+            page.wait_for_timeout(2000)
             accept_cookies(page)
+            page.wait_for_timeout(1000)
 
-            # 2) Vérifier si le film est listé sur la page du cinéma
-            try:
-                page.get_by_role("link", name=re.compile(re.escape(FILM_NAME), re.I)).first.wait_for(timeout=8000)
-                debug_info["film_found_on_cinema_page"] = True
-                log("✅ Film trouvé sur la page cinéma")
-            except Exception:
-                log("ℹ️ Film non trouvé sur la page cinéma (pas encore programmé à Brumath)")
-                browser.close()
-                return False, debug_info
-
-            # 3) Cliquer sur le film depuis la page cinéma
-            page.get_by_role("link", name=re.compile(re.escape(FILM_NAME), re.I)).first.click(timeout=8000)
-            page.wait_for_load_state("networkidle")
-            page.wait_for_timeout(1500)
-
-            debug_info["film_page_url"] = page.url
-            log(f"🎬 Page film ouverte depuis cinéma: {page.url}")
-
-            accept_cookies(page)
-
-            # 4) Lire le texte et détecter réservation/horaires
+            # 2) Lire texte complet
             body_text = page.inner_text("body")
             browser.close()
 
-        reservation_keywords = ["réserver", "reserver", "e-billet", "billetterie"]
-        reservation_signal = any(k in body_text.lower() for k in reservation_keywords)
-        debug_info["reservation_signal"] = reservation_signal
+        # Normalisation
+        text_low = body_text.lower().replace("\u00a0", " ")
+        film_low = FILM_NAME.lower().replace("\u00a0", " ")
 
+        # Repérer le film dans la page
+        idx = text_low.find(film_low)
+        if idx == -1:
+            debug_info["film_found_on_cinema_page"] = False
+            log("ℹ️ Film non trouvé sur la page cinéma (titre non détecté).")
+            return False, debug_info
+
+        debug_info["film_found_on_cinema_page"] = True
+        log("✅ Film détecté sur la page cinéma")
+
+        # Prendre une fenêtre de texte après le titre pour capturer les horaires associés à ce film
+        window = text_low[idx : idx + 6000]
+
+        # Signaux réservation (optionnel)
+        reservation_keywords = ["réserver", "reserver", "e-billet", "billetterie"]
+        debug_info["reservation_signal"] = any(k in window for k in reservation_keywords)
+
+        # Horaires HH:MM
         horaire_pattern = r"\b(?:[01]\d|2[0-3]):[0-5]\d\b"
-        horaires = re.findall(horaire_pattern, body_text)
+        horaires = re.findall(horaire_pattern, window)
         debug_info["nb_horaires"] = len(horaires)
 
-        available = reservation_signal or debug_info["nb_horaires"] > 0
+        available = debug_info["reservation_signal"] or debug_info["nb_horaires"] > 0
 
         log(
-            f"🔎 reservation_signal={debug_info['reservation_signal']} | "
+            f"🔎 film_found={debug_info['film_found_on_cinema_page']} | "
+            f"reservation_signal={debug_info['reservation_signal']} | "
             f"nb_horaires={debug_info['nb_horaires']} | available={available}"
         )
         return available, debug_info
@@ -203,7 +200,6 @@ def main():
             f"URL cinéma: {CINEMA_URL}\n\n"
             f"Détails:\n"
             f"- film_found_on_cinema_page: {debug.get('film_found_on_cinema_page')}\n"
-            f"- film_page_url: {debug.get('film_page_url')}\n"
             f"- reservation_signal: {debug['reservation_signal']}\n"
             f"- nb_horaires: {debug['nb_horaires']}\n"
             f"- error: {debug.get('error')}\n\n"
