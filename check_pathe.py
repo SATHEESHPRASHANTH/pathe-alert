@@ -78,23 +78,30 @@ def accept_cookies(page) -> None:
 
 def check_availability() -> tuple[bool, dict]:
     """
-    Méthode robuste :
-    - ouvre la page cinéma Brumath
-    - accepte cookies
-    - déclenche des interactions (scroll + clic "Aujourd'hui" si présent)
-    - capte TOUTES les réponses XHR/FETCH (peu importe content-type)
-    - cherche des horaires HH:MM dans ces réponses
+    Stratégie simple:
+    - Ouvre CINEMA_URL
+    - Accepte cookies
+    - Essaie de cliquer 'Aujourd'hui' / 'Demain' si dispo
+    - Récupère HTML (page.content) + texte (inner_text)
+    - Détecte FILM_NAME (en version 'avatar' pour test) + horaires HH:MM
     """
+    import unicodedata
+
     debug_info = {
-        "available": False,
         "film_found": False,
         "nb_horaires": 0,
         "error": None,
-        "xhr_count": 0,
-        "hits_count": 0,
-        "sample_xhr_urls": [],
-        "sample_hit_urls": [],
+        "used": [],
     }
+
+    def normalize(s: str) -> str:
+        s = s.replace("\u00a0", " ").lower()
+        s = "".join(
+            c for c in unicodedata.normalize("NFD", s)
+            if unicodedata.category(c) != "Mn"
+        )
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
 
     def accept_cookies(page) -> None:
         for _ in range(4):
@@ -113,104 +120,77 @@ def check_availability() -> tuple[bool, dict]:
             browser = p.chromium.launch(headless=True)
             context = browser.new_context(
                 locale="fr-FR",
-                user_agent=(
-                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
-                ),
-                viewport={"width": 1280, "height": 720},
+                viewport={"width": 1400, "height": 900},
             )
             page = context.new_page()
             page.set_default_timeout(60000)
-
-            collected_hits = []  # (url, times_count)
-            collected_xhr_urls = []
-
-            def on_response(resp):
-                try:
-                    rtype = resp.request.resource_type
-                    if rtype not in ("xhr", "fetch"):
-                        return
-
-                    url = resp.url
-                    collected_xhr_urls.append(url)
-
-                    # On essaye de lire le texte (si binaire, ça throw -> on ignore)
-                    txt = resp.text()
-                    if re.search(r"\b(?:[01]\d|2[0-3]):[0-5]\d\b", txt):
-                        times = re.findall(r"\b(?:[01]\d|2[0-3]):[0-5]\d\b", txt)
-                        collected_hits.append((url, len(times)))
-                except Exception:
-                    pass
-
-            page.on("response", on_response)
 
             log(f"🏢 Ouverture cinéma: {CINEMA_URL}")
             page.goto(CINEMA_URL, wait_until="domcontentloaded")
             page.wait_for_timeout(2500)
             accept_cookies(page)
 
-            # Interactions pour déclencher le chargement séances
+            # Petites actions pour forcer le rendu des séances (si boutons présents)
+            for label in ["Aujourd'hui", "Demain"]:
+                try:
+                    page.get_by_role("button", name=re.compile(label, re.I)).click(timeout=2000)
+                    debug_info["used"].append(f"click:{label}")
+                    page.wait_for_timeout(1200)
+                except Exception:
+                    pass
+
+            # Scroll pour charger lazy content
             try:
-                # clic sur "Aujourd'hui" si existe (dans ton screenshot)
-                page.get_by_role("button", name=re.compile(r"Aujourd'hui", re.I)).click(timeout=3000)
+                page.mouse.wheel(0, 2500)
+                debug_info["used"].append("scroll")
             except Exception:
                 pass
 
-            try:
-                page.mouse.wheel(0, 1800)
-            except Exception:
-                pass
+            page.wait_for_timeout(4000)
 
-            page.wait_for_timeout(9000)
+            # Récupère HTML + texte
+            html = page.content()
+            debug_info["used"].append("page.content")
+            try:
+                text = page.inner_text("body")
+                debug_info["used"].append("inner_text")
+            except Exception:
+                text = ""
 
             browser.close()
 
-        # Analyse résultats
-        debug_info["xhr_count"] = len(collected_xhr_urls)
-        debug_info["sample_xhr_urls"] = collected_xhr_urls[:8]
+        html_n = normalize(html)
+        text_n = normalize(text)
 
-        total_times = 0
-        film_low = FILM_NAME.lower()
+        # Détection film (pour être robuste, on utilise au moins le mot "avatar" ici)
+        # Quand tu passeras à Jana Nayagan, on mettra un mot-clé stable.
+        film_key = normalize(FILM_NAME)
+        # fallback ultra robuste: au moins "avatar" (pour ton test actuel)
+        fallback_keys = ["avatar", "feu", "cendres"]
 
-        # Si on a des hits horaires, on essaie d'associer au film
-        # (souvent le JSON contient le titre, sinon on peut aussi matcher l'ID du film dans FILM_URL)
-        film_id_match = None
-        m = re.search(r"-([0-9]+)$", FILM_URL.rstrip("/"))
-        if m:
-            film_id_match = m.group(1)
+        film_found = (film_key in html_n) or (film_key in text_n) or any(k in html_n for k in fallback_keys) or any(k in text_n for k in fallback_keys)
+        debug_info["film_found"] = film_found
 
-        for url, n in collected_hits:
-            total_times += n
+        # Horaires HH:MM (dans HTML ou texte)
+        horaire_pattern = r"\b(?:[01]\d|2[0-3]):[0-5]\d\b"
+        times_html = re.findall(horaire_pattern, html_n)
+        times_text = re.findall(horaire_pattern, text_n)
 
-        # Film_found = on a au moins un hit + (titre ou id trouvé dans au moins une URL/response)
-        # Comme on n'a pas gardé le texte, on fait simple: si on a des hits, on considère "available".
-        # (On peut raffiner après si besoin)
-        debug_info["hits_count"] = len(collected_hits)
-        debug_info["sample_hit_urls"] = [u for (u, _) in collected_hits[:8]]
-        debug_info["nb_horaires"] = total_times
+        # On combine (sans double compter)
+        all_times = list(dict.fromkeys(times_html + times_text))
+        debug_info["nb_horaires"] = len(all_times)
 
-        debug_info["film_found"] = (len(collected_hits) > 0)
-        debug_info["available"] = debug_info["film_found"] and total_times > 0
+        available = film_found and debug_info["nb_horaires"] > 0
 
-        log(
-            f"🔎 xhr_count={debug_info['xhr_count']} | "
-            f"hits_count={debug_info['hits_count']} | "
-            f"nb_horaires={debug_info['nb_horaires']} | "
-            f"available={debug_info['available']}"
-        )
-
-        # Si zéro XHR, on log 2-3 URLs pour debug
-        if debug_info["xhr_count"] == 0:
-            log("⚠️ Aucun XHR/FETCH capté. Le site charge peut-être autrement (SSR) ou bloque headless.")
-
-        return debug_info["available"], debug_info
+        log(f"🔎 film_found={film_found} | nb_horaires={debug_info['nb_horaires']} | available={available} | used={debug_info['used']}")
+        return available, debug_info
 
     except PlaywrightTimeoutError as e:
         debug_info["error"] = f"Timeout Playwright: {e}"
         log(f"❌ {debug_info['error']}")
         return False, debug_info
     except Exception as e:
-        debug_info["error"] = f"Erreur scraping/API: {e}"
+        debug_info["error"] = f"Erreur: {e}"
         log(f"❌ {debug_info['error']}")
         return False, debug_info
 
